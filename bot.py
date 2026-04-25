@@ -5,43 +5,33 @@ import yt_dlp
 import asyncio
 import os
 import re
+import glob
 
-# ─── Configuration ───────────────────────────────────────────────
 TOKEN = os.environ.get("DISCORD_TOKEN")
 if not TOKEN:
     raise ValueError("❌ Variable d'environnement DISCORD_TOKEN manquante !")
 
-# ─── yt-dlp options ──────────────────────────────────────────────
-YDL_OPTIONS = {
+# ─── yt-dlp : téléchargement audio en MP3 ────────────────────────
+YDL_DOWNLOAD_OPTIONS = {
     "format": "bestaudio/best",
+    "outtmpl": "/tmp/music.%(ext)s",
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
-    "default_search": "ytsearch",
-    "source_address": "0.0.0.0",
-    "age_limit": None,
-    "extractor_retries": 3,
-    "http_headers": {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    },
+    "postprocessors": [{
+        "key": "FFmpegExtractAudio",
+        "preferredcodec": "mp3",
+        "preferredquality": "192",
+    }],
 }
 
-FFMPEG_STREAM_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
-}
-
-FFMPEG_FILE_OPTIONS = {
-    "options": "-vn",
-}
+FFMPEG_OPTIONS = {"options": "-vn"}
 
 # ─── Bot setup ───────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
-
 bot = commands.Bot(command_prefix="!", intents=intents)
-
 music_state: dict[int, dict] = {}
 
 
@@ -49,32 +39,29 @@ def is_url(s: str) -> bool:
     return bool(re.match(r"https?://", s))
 
 
-def resolve_source(query: str) -> str:
-    with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
-        info = ydl.extract_info(query, download=False)
-        if "entries" in info:
-            info = info["entries"][0]
-        formats = info.get("formats", [])
-        # Priorité : audio seul sans vidéo
-        audio_only = [
-            f for f in formats
-            if f.get("acodec") != "none" and f.get("vcodec") == "none"
-        ]
-        if audio_only:
-            # Prendre le meilleur bitrate
-            best = max(audio_only, key=lambda f: f.get("abr") or 0)
-            return best["url"]
-        # Fallback : meilleur format dispo
-        return info["url"]
+def download_audio(query: str) -> str:
+    """Télécharge l'audio en /tmp/music.mp3 et retourne le chemin."""
+    # Supprimer l'ancien fichier
+    for f in glob.glob("/tmp/music.*"):
+        os.remove(f)
+
+    opts = dict(YDL_DOWNLOAD_OPTIONS)
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([query])
+
+    # Trouver le fichier téléchargé
+    files = glob.glob("/tmp/music.*")
+    if not files:
+        raise Exception("Fichier audio introuvable après téléchargement")
+    return files[0]
 
 
-def make_audio_source(source_url: str, volume: float) -> discord.PCMVolumeTransformer:
-    ffmpeg_opts = FFMPEG_STREAM_OPTIONS if is_url(source_url) else FFMPEG_FILE_OPTIONS
-    audio = discord.FFmpegPCMAudio(source_url, **ffmpeg_opts)
+def make_source(path: str, volume: float) -> discord.PCMVolumeTransformer:
+    audio = discord.FFmpegPCMAudio(path, **FFMPEG_OPTIONS)
     return discord.PCMVolumeTransformer(audio, volume=volume)
 
 
-def play_audio(vc: discord.VoiceClient, source_url: str, guild_id: int, loop: asyncio.AbstractEventLoop):
+def play_audio(vc: discord.VoiceClient, path: str, guild_id: int, loop: asyncio.AbstractEventLoop):
 
     async def restart():
         await asyncio.sleep(0.5)
@@ -82,8 +69,13 @@ def play_audio(vc: discord.VoiceClient, source_url: str, guild_id: int, loop: as
         if not state.get("loop") or not vc.is_connected():
             return
         try:
-            new_url = resolve_source(state["source"]) if is_url(state["source"]) else state["source"]
-            audio = make_audio_source(new_url, state.get("volume", 0.5))
+            source_key = state["source"]
+            # Re-télécharger si URL (le stream local peut expirer)
+            if is_url(source_key):
+                new_path = await loop.run_in_executor(None, download_audio, source_key)
+            else:
+                new_path = source_key
+            audio = make_source(new_path, state.get("volume", 0.5))
             vc.play(audio, after=lambda e: on_after(e))
         except Exception as ex:
             print(f"Erreur restart : {ex}")
@@ -95,7 +87,7 @@ def play_audio(vc: discord.VoiceClient, source_url: str, guild_id: int, loop: as
         if state.get("loop") and vc.is_connected():
             asyncio.run_coroutine_threadsafe(restart(), loop)
 
-    audio = make_audio_source(source_url, music_state.get(guild_id, {}).get("volume", 0.5))
+    audio = make_source(path, music_state.get(guild_id, {}).get("volume", 0.5))
     vc.play(audio, after=lambda e: on_after(e))
 
 
@@ -133,9 +125,9 @@ async def deconecte(interaction: discord.Interaction):
         await interaction.followup.send("❌ Le bot n'est pas dans un canal vocal.")
 
 
-@bot.tree.command(name="play", description="Joue un lien YouTube ou un fichier MP3 (en boucle infinie)")
+@bot.tree.command(name="play", description="Joue un lien YouTube ou un fichier MP3 en boucle infinie")
 @app_commands.describe(
-    lien="URL YouTube ou recherche texte (ex: 'lofi hip hop')",
+    lien="URL YouTube ou texte de recherche (ex: 'lofi hip hop')",
     fichier="Fichier audio MP3 à jouer"
 )
 async def play(
@@ -157,15 +149,18 @@ async def play(
         return
 
     try:
+        loop = asyncio.get_event_loop()
+
         if fichier:
             file_path = f"/tmp/{fichier.filename}"
             await fichier.save(file_path)
             source_key = file_path
-            source_url = file_path
+            audio_path = file_path
             label = fichier.filename
         else:
+            await interaction.followup.send("⏳ Téléchargement en cours...")
             source_key = lien
-            source_url = resolve_source(lien)
+            audio_path = await loop.run_in_executor(None, download_audio, lien)
             label = lien
 
         if vc.is_playing() or vc.is_paused():
@@ -179,12 +174,8 @@ async def play(
             "volume": 0.5,
         }
 
-        loop = asyncio.get_event_loop()
-        play_audio(vc, source_url, interaction.guild_id, loop)
-
-        await interaction.followup.send(
-            f"▶️ **En cours** : `{label}`\n🔁 Boucle infinie activée."
-        )
+        play_audio(vc, audio_path, interaction.guild_id, loop)
+        await interaction.followup.send(f"▶️ **En cours** : `{label}`\n🔁 Boucle infinie activée.")
 
     except Exception as e:
         print(f"Erreur play : {e}")
@@ -227,4 +218,3 @@ async def volume(interaction: discord.Interaction, niveau: int):
 
 
 bot.run(TOKEN)
-
