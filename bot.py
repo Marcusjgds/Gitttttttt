@@ -33,13 +33,12 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# État par serveur : { guild_id: { "source": url_ou_path, "loop": bool, "paused": bool } }
+# État par serveur
 music_state: dict[int, dict] = {}
 
 
 # ─── Helper : résoudre la source audio ───────────────────────────
 def resolve_source(query: str) -> str:
-    """Retourne l'URL du stream audio depuis un lien YouTube/autre ou un chemin local."""
     url_pattern = re.compile(r"https?://")
     if url_pattern.match(query):
         with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
@@ -47,29 +46,44 @@ def resolve_source(query: str) -> str:
             if "entries" in info:
                 info = info["entries"][0]
             formats = info.get("formats", [])
-            audio_formats = [f for f in formats if f.get("acodec") != "none" and f.get("vcodec") == "none"]
+            audio_formats = [
+                f for f in formats
+                if f.get("acodec") != "none" and f.get("vcodec") == "none"
+            ]
             if audio_formats:
                 return audio_formats[-1]["url"]
             return info["url"]
-    return query  # fichier local
+    return query
 
 
-# ─── Helper : lancer la lecture ──────────────────────────────────
-def play_audio(vc: discord.VoiceClient, source_url: str, guild_id: int):
-    """Lance FFmpegPCMAudio et reboucle automatiquement."""
-    def after_play(error):
+# ─── Helper : lancer la lecture avec boucle correcte ─────────────
+def play_audio(vc: discord.VoiceClient, source_url: str, guild_id: int, loop: asyncio.AbstractEventLoop):
+    """Lance FFmpegPCMAudio. Le callback after_play utilise run_coroutine_threadsafe
+    pour reprogrammer la lecture dans la boucle asyncio principale."""
+
+    async def restart():
+        await asyncio.sleep(0.5)  # petite pause pour éviter les conflits
+        state = music_state.get(guild_id, {})
+        if not state.get("loop") or not vc.is_connected():
+            return
+        try:
+            new_url = resolve_source(state["source"])
+            audio = discord.FFmpegPCMAudio(new_url, **FFMPEG_OPTIONS)
+            audio = discord.PCMVolumeTransformer(audio, volume=state.get("volume", 0.5))
+            vc.play(audio, after=lambda e: on_after(e))
+        except Exception as ex:
+            print(f"Erreur restart : {ex}")
+
+    def on_after(error):
         if error:
             print(f"Erreur lecture : {error}")
         state = music_state.get(guild_id, {})
         if state.get("loop") and vc.is_connected():
-            new_url = resolve_source(state["source"])
-            audio = discord.FFmpegPCMAudio(new_url, **FFMPEG_OPTIONS)
-            audio = discord.PCMVolumeTransformer(audio, volume=0.5)
-            vc.play(audio, after=after_play)
+            asyncio.run_coroutine_threadsafe(restart(), loop)
 
     audio = discord.FFmpegPCMAudio(source_url, **FFMPEG_OPTIONS)
-    audio = discord.PCMVolumeTransformer(audio, volume=0.5)
-    vc.play(audio, after=after_play)
+    audio = discord.PCMVolumeTransformer(audio, volume=music_state.get(guild_id, {}).get("volume", 0.5))
+    vc.play(audio, after=lambda e: on_after(e))
 
 
 # ─── Events ──────────────────────────────────────────────────────
@@ -104,9 +118,9 @@ async def connect(interaction: discord.Interaction):
 async def deconecte(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if vc:
+        music_state.pop(interaction.guild_id, None)
         vc.stop()
         await vc.disconnect()
-        music_state.pop(interaction.guild_id, None)
         await interaction.response.send_message("👋 Bot déconnecté du canal vocal.")
     else:
         await interaction.response.send_message("❌ Le bot n'est pas dans un canal vocal.", ephemeral=True)
@@ -115,7 +129,7 @@ async def deconecte(interaction: discord.Interaction):
 # ─── /play ───────────────────────────────────────────────────────
 @bot.tree.command(name="play", description="Joue un lien YouTube ou un fichier MP3 (en boucle infinie)")
 @app_commands.describe(
-    lien="URL YouTube / SoundCloud ou laisse vide si tu envoies un fichier",
+    lien="URL YouTube / SoundCloud",
     fichier="Fichier audio MP3 à jouer"
 )
 async def play(
@@ -123,20 +137,17 @@ async def play(
     lien: str = None,
     fichier: discord.Attachment = None,
 ):
+    # Auto-connect au canal de l'utilisateur
     vc = interaction.guild.voice_client
-
     if not vc:
         if not interaction.user.voice or not interaction.user.voice.channel:
-            await interaction.response.send_message(
-                "❌ Rejoins un canal vocal d'abord !", ephemeral=True
-            )
+            await interaction.response.send_message("❌ Rejoins un canal vocal d'abord !", ephemeral=True)
             return
         vc = await interaction.user.voice.channel.connect()
+        await asyncio.sleep(1)  # attendre que la connexion soit stable
 
     if not lien and not fichier:
-        await interaction.response.send_message(
-            "❌ Fournis un lien ou un fichier audio.", ephemeral=True
-        )
+        await interaction.response.send_message("❌ Fournis un lien ou un fichier audio.", ephemeral=True)
         return
 
     await interaction.response.defer()
@@ -153,16 +164,21 @@ async def play(
             source_url = resolve_source(lien)
             label = lien
 
+        # Arrêter proprement la lecture en cours
         if vc.is_playing() or vc.is_paused():
             vc.stop()
+            await asyncio.sleep(0.5)
 
         music_state[interaction.guild_id] = {
             "source": source_key,
             "loop": True,
             "paused": False,
+            "volume": 0.5,
         }
 
-        play_audio(vc, source_url, interaction.guild_id)
+        loop = asyncio.get_event_loop()
+        play_audio(vc, source_url, interaction.guild_id, loop)
+
         await interaction.followup.send(
             f"▶️ **En cours** : `{label}`\n🔁 Lecture en boucle infinie activée."
         )
@@ -184,12 +200,10 @@ async def pause(interaction: discord.Interaction):
     if vc.is_playing():
         vc.pause()
         state["paused"] = True
-        music_state[interaction.guild_id] = state
         await interaction.response.send_message("⏸️ Lecture mise en pause.")
     elif vc.is_paused():
         vc.resume()
         state["paused"] = False
-        music_state[interaction.guild_id] = state
         await interaction.response.send_message("▶️ Lecture reprise.")
     else:
         await interaction.response.send_message("❌ Aucune musique en cours.", ephemeral=True)
@@ -201,7 +215,10 @@ async def pause(interaction: discord.Interaction):
 async def volume(interaction: discord.Interaction, niveau: int):
     vc = interaction.guild.voice_client
     if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
-        vc.source.volume = max(0.0, min(1.0, niveau / 100))
+        vol = max(0.0, min(1.0, niveau / 100))
+        vc.source.volume = vol
+        state = music_state.get(interaction.guild_id, {})
+        state["volume"] = vol
         await interaction.response.send_message(f"🔊 Volume réglé à **{niveau}%**.")
     else:
         await interaction.response.send_message("❌ Aucune musique en cours.", ephemeral=True)
