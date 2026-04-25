@@ -11,6 +11,16 @@ TOKEN = os.environ.get("DISCORD_TOKEN")
 if not TOKEN:
     raise ValueError("❌ Variable d'environnement DISCORD_TOKEN manquante !")
 
+# ─── Cookies YouTube (optionnel) ─────────────────────────────────
+COOKIES_PATH = None
+_cookies_b64 = os.environ.get("YOUTUBE_COOKIES")
+if _cookies_b64:
+    import base64
+    COOKIES_PATH = "/tmp/yt_cookies.txt"
+    with open(COOKIES_PATH, "wb") as _f:
+        _f.write(base64.b64decode(_cookies_b64))
+    print("🍪 Cookies YouTube chargés.")
+
 # ─── yt-dlp : téléchargement audio en MP3 ────────────────────────
 YDL_DOWNLOAD_OPTIONS = {
     "format": "bestaudio/best",
@@ -18,6 +28,7 @@ YDL_DOWNLOAD_OPTIONS = {
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
+    **({"cookiefile": COOKIES_PATH} if COOKIES_PATH else {}),
     "postprocessors": [{
         "key": "FFmpegExtractAudio",
         "preferredcodec": "mp3",
