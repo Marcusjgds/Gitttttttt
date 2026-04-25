@@ -1,0 +1,21 @@
+# Secrets — NE JAMAIS commit le token !
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Fichiers audio temporaires
+/tmp/
+*.mp3
+*.wav
+*.ogg
+
+# OS
+.DS_Store
+Thumbs.db
