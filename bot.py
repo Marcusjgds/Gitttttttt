@@ -17,17 +17,20 @@ YDL_OPTIONS = {
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
-    "default_search": "auto",
+    "default_search": "ytsearch",
     "source_address": "0.0.0.0",
+    "age_limit": None,
+    "extractor_retries": 3,
+    "http_headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    },
 }
 
-# Options FFmpeg pour les streams réseau (YouTube, etc.)
 FFMPEG_STREAM_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
 }
 
-# Options FFmpeg pour les fichiers locaux (MP3 uploadé)
 FFMPEG_FILE_OPTIONS = {
     "options": "-vn",
 }
@@ -42,38 +45,35 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 music_state: dict[int, dict] = {}
 
 
-# ─── Helper : est-ce une URL ? ───────────────────────────────────
 def is_url(s: str) -> bool:
     return bool(re.match(r"https?://", s))
 
 
-# ─── Helper : résoudre la source audio ───────────────────────────
 def resolve_source(query: str) -> str:
-    if is_url(query):
-        with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
-            info = ydl.extract_info(query, download=False)
-            if "entries" in info:
-                info = info["entries"][0]
-            formats = info.get("formats", [])
-            audio_formats = [
-                f for f in formats
-                if f.get("acodec") != "none" and f.get("vcodec") == "none"
-            ]
-            if audio_formats:
-                return audio_formats[-1]["url"]
-            return info["url"]
-    return query  # fichier local
+    with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
+        info = ydl.extract_info(query, download=False)
+        if "entries" in info:
+            info = info["entries"][0]
+        formats = info.get("formats", [])
+        # Priorité : audio seul sans vidéo
+        audio_only = [
+            f for f in formats
+            if f.get("acodec") != "none" and f.get("vcodec") == "none"
+        ]
+        if audio_only:
+            # Prendre le meilleur bitrate
+            best = max(audio_only, key=lambda f: f.get("abr") or 0)
+            return best["url"]
+        # Fallback : meilleur format dispo
+        return info["url"]
 
 
-# ─── Helper : créer la source audio avec les bons flags FFmpeg ───
 def make_audio_source(source_url: str, volume: float) -> discord.PCMVolumeTransformer:
-    # Fichier local = pas de reconnect, stream réseau = reconnect
     ffmpeg_opts = FFMPEG_STREAM_OPTIONS if is_url(source_url) else FFMPEG_FILE_OPTIONS
     audio = discord.FFmpegPCMAudio(source_url, **ffmpeg_opts)
     return discord.PCMVolumeTransformer(audio, volume=volume)
 
 
-# ─── Helper : lancer la lecture avec boucle asyncio correcte ─────
 def play_audio(vc: discord.VoiceClient, source_url: str, guild_id: int, loop: asyncio.AbstractEventLoop):
 
     async def restart():
@@ -82,7 +82,7 @@ def play_audio(vc: discord.VoiceClient, source_url: str, guild_id: int, loop: as
         if not state.get("loop") or not vc.is_connected():
             return
         try:
-            new_url = resolve_source(state["source"])
+            new_url = resolve_source(state["source"]) if is_url(state["source"]) else state["source"]
             audio = make_audio_source(new_url, state.get("volume", 0.5))
             vc.play(audio, after=lambda e: on_after(e))
         except Exception as ex:
@@ -99,35 +99,27 @@ def play_audio(vc: discord.VoiceClient, source_url: str, guild_id: int, loop: as
     vc.play(audio, after=lambda e: on_after(e))
 
 
-# ─── Events ──────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
     await bot.tree.sync()
     print(f"✅ Bot connecté : {bot.user} | Commandes slash synchronisées.")
 
 
-# ─── /connect ────────────────────────────────────────────────────
 @bot.tree.command(name="connect", description="Connecte le bot à ton canal vocal")
 async def connect(interaction: discord.Interaction):
     if not interaction.user.voice or not interaction.user.voice.channel:
         await interaction.response.send_message("❌ Tu dois être dans un canal vocal d'abord !", ephemeral=True)
         return
-
-    # Defer immédiatement pour éviter l'expiration de l'interaction (3s max)
     await interaction.response.defer()
-
     channel = interaction.user.voice.channel
-    guild = interaction.guild
-
-    if guild.voice_client:
-        await guild.voice_client.move_to(channel)
+    if interaction.guild.voice_client:
+        await interaction.guild.voice_client.move_to(channel)
         await interaction.followup.send(f"🔀 Déplacé vers **{channel.name}**.")
     else:
         await channel.connect()
         await interaction.followup.send(f"🎵 Connecté à **{channel.name}** !")
 
 
-# ─── /deconecte ──────────────────────────────────────────────────
 @bot.tree.command(name="deconecte", description="Déconnecte le bot du canal vocal")
 async def deconecte(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -136,15 +128,14 @@ async def deconecte(interaction: discord.Interaction):
         music_state.pop(interaction.guild_id, None)
         vc.stop()
         await vc.disconnect()
-        await interaction.followup.send("👋 Bot déconnecté du canal vocal.")
+        await interaction.followup.send("👋 Bot déconnecté.")
     else:
         await interaction.followup.send("❌ Le bot n'est pas dans un canal vocal.")
 
 
-# ─── /play ───────────────────────────────────────────────────────
 @bot.tree.command(name="play", description="Joue un lien YouTube ou un fichier MP3 (en boucle infinie)")
 @app_commands.describe(
-    lien="URL YouTube / SoundCloud",
+    lien="URL YouTube ou recherche texte (ex: 'lofi hip hop')",
     fichier="Fichier audio MP3 à jouer"
 )
 async def play(
@@ -152,7 +143,6 @@ async def play(
     lien: str = None,
     fichier: discord.Attachment = None,
 ):
-    # Defer immédiatement — la connexion voice + yt-dlp peut prendre du temps
     await interaction.response.defer()
 
     vc = interaction.guild.voice_client
@@ -193,14 +183,14 @@ async def play(
         play_audio(vc, source_url, interaction.guild_id, loop)
 
         await interaction.followup.send(
-            f"▶️ **En cours** : `{label}`\n🔁 Lecture en boucle infinie activée."
+            f"▶️ **En cours** : `{label}`\n🔁 Boucle infinie activée."
         )
 
     except Exception as e:
+        print(f"Erreur play : {e}")
         await interaction.followup.send(f"❌ Erreur : `{e}`")
 
 
-# ─── /pause ──────────────────────────────────────────────────────
 @bot.tree.command(name="pause", description="Met en pause ou reprend la lecture")
 async def pause(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -208,22 +198,19 @@ async def pause(interaction: discord.Interaction):
     if not vc:
         await interaction.followup.send("❌ Le bot n'est pas dans un canal vocal.")
         return
-
     state = music_state.get(interaction.guild_id, {})
-
     if vc.is_playing():
         vc.pause()
         state["paused"] = True
-        await interaction.followup.send("⏸️ Lecture mise en pause.")
+        await interaction.followup.send("⏸️ Pause.")
     elif vc.is_paused():
         vc.resume()
         state["paused"] = False
-        await interaction.followup.send("▶️ Lecture reprise.")
+        await interaction.followup.send("▶️ Reprise.")
     else:
         await interaction.followup.send("❌ Aucune musique en cours.")
 
 
-# ─── /volume ─────────────────────────────────────────────────────
 @bot.tree.command(name="volume", description="Règle le volume (0–100)")
 @app_commands.describe(niveau="Volume entre 0 et 100")
 async def volume(interaction: discord.Interaction, niveau: int):
@@ -234,10 +221,10 @@ async def volume(interaction: discord.Interaction, niveau: int):
         vc.source.volume = vol
         state = music_state.get(interaction.guild_id, {})
         state["volume"] = vol
-        await interaction.followup.send(f"🔊 Volume réglé à **{niveau}%**.")
+        await interaction.followup.send(f"🔊 Volume : **{niveau}%**")
     else:
         await interaction.followup.send("❌ Aucune musique en cours.")
 
 
-# ─── Lancement ───────────────────────────────────────────────────
 bot.run(TOKEN)
+
