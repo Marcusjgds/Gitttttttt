@@ -102,6 +102,18 @@ async def on_ready():
     print(f"✅ Bot connecté : {bot.user} | Commandes slash synchronisées.")
 
 
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Nettoie l'état si le bot est déconnecté de force."""
+    if member.id != bot.user.id:
+        return
+    if before.channel and not after.channel:
+        # Le bot a été déconnecté
+        guild_id = before.channel.guild.id
+        music_state.pop(guild_id, None)
+        print(f"⚠️ Bot déconnecté du vocal sur {before.channel.guild.name}")
+
+
 @bot.tree.command(name="connect", description="Connecte le bot à ton canal vocal")
 async def connect(interaction: discord.Interaction):
     if not interaction.user.voice or not interaction.user.voice.channel:
@@ -109,13 +121,14 @@ async def connect(interaction: discord.Interaction):
         return
     await interaction.response.defer()
     channel = interaction.user.voice.channel
+    # Déconnecter proprement si déjà connecté (évite le 4006)
     if interaction.guild.voice_client:
-        await interaction.guild.voice_client.move_to(channel)
-        await interaction.followup.send(f"🔀 Déplacé vers **{channel.name}**.")
-    else:
-        await channel.connect(timeout=60, reconnect=True)
-        await asyncio.sleep(1)  # laisser la connexion se stabiliser
-        await interaction.followup.send(f"🎵 Connecté à **{channel.name}** !")
+        await interaction.guild.voice_client.disconnect(force=True)
+        await asyncio.sleep(1)
+    
+    vc = await channel.connect(timeout=60, reconnect=True, self_deaf=True)
+    await asyncio.sleep(1)
+    await interaction.followup.send(f"🎵 Connecté à **{channel.name}** !")
 
 
 @bot.tree.command(name="deconecte", description="Déconnecte le bot du canal vocal")
@@ -148,8 +161,11 @@ async def play(
         if not interaction.user.voice or not interaction.user.voice.channel:
             await interaction.followup.send("❌ Rejoins un canal vocal d'abord !")
             return
-        vc = await interaction.user.voice.channel.connect(timeout=60, reconnect=True)
-        await asyncio.sleep(1)  # laisser la connexion se stabiliser
+        if interaction.guild.voice_client:
+            await interaction.guild.voice_client.disconnect(force=True)
+            await asyncio.sleep(1)
+        vc = await interaction.user.voice.channel.connect(timeout=60, reconnect=True, self_deaf=True)
+        await asyncio.sleep(1)
     
     # Attendre que le voice client soit vraiment prêt (max 10s)
     for _ in range(20):
