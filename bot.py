@@ -113,7 +113,8 @@ async def connect(interaction: discord.Interaction):
         await interaction.guild.voice_client.move_to(channel)
         await interaction.followup.send(f"🔀 Déplacé vers **{channel.name}**.")
     else:
-        await channel.connect()
+        await channel.connect(timeout=60, reconnect=True)
+        await asyncio.sleep(1)  # laisser la connexion se stabiliser
         await interaction.followup.send(f"🎵 Connecté à **{channel.name}** !")
 
 
@@ -147,7 +148,17 @@ async def play(
         if not interaction.user.voice or not interaction.user.voice.channel:
             await interaction.followup.send("❌ Rejoins un canal vocal d'abord !")
             return
-        vc = await interaction.user.voice.channel.connect()
+        vc = await interaction.user.voice.channel.connect(timeout=60, reconnect=True)
+        await asyncio.sleep(1)  # laisser la connexion se stabiliser
+    
+    # Attendre que le voice client soit vraiment prêt (max 10s)
+    for _ in range(20):
+        if vc.is_connected():
+            break
+        await asyncio.sleep(0.5)
+    else:
+        await interaction.followup.send("❌ Impossible de se connecter au canal vocal.")
+        return
 
     if not lien and not fichier:
         await interaction.followup.send("❌ Fournis un lien ou un fichier audio.")
